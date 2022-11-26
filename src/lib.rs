@@ -12,17 +12,14 @@
 
 #![deny(missing_docs)]
 #![deny(warnings)]
+#![allow(non_camel_case_types)]
 #![no_std]
 
 extern crate cast;
 extern crate embedded_hal as hal;
 extern crate generic_array;
 
-use core::mem;
-
 use cast::u16;
-use generic_array::typenum::consts::*;
-use generic_array::{ArrayLength, GenericArray};
 use hal::blocking::i2c::{Write, WriteRead};
 
 mod accel;
@@ -46,6 +43,14 @@ where
         // configure the accelerometer to operate at 400 Hz
         lsm303dlhc.write_accel_register(accel::Register::CTRL_REG1_A, 0b0111_0_111)?;
 
+        // reboot the accelerometer fifo memory
+        lsm303dlhc.write_accel_register(accel::Register::CTRL_REG5_A, 0b1000_0000)?;
+        lsm303dlhc.write_accel_register(accel::Register::CTRL_REG5_A, 0b1000_0000)?;
+        lsm303dlhc.write_accel_register(accel::Register::CTRL_REG6_A, 0b0001_0000)?;
+        lsm303dlhc.write_accel_register(accel::Register::CTRL_REG6_A, 0b0000_0000)?;
+
+        
+
         // configure the magnetometer to operate in continuous mode
         lsm303dlhc.write_mag_register(mag::Register::MR_REG_M, 0b00)?;
 
@@ -56,14 +61,22 @@ where
     }
 
     /// Accelerometer measurements
-    pub fn accel(&mut self) -> Result<I16x3, E> {
-        let buffer: GenericArray<u8, U6> = self.read_accel_registers(accel::Register::OUT_X_L_A)?;
+    pub fn accel_fifo<const N: usize, const M: usize>(&mut self) -> Result<I16x3Buf<M>, E> {
 
-        Ok(I16x3 {
-            x: (u16(buffer[0]) + (u16(buffer[1]) << 8)) as i16,
-            y: (u16(buffer[2]) + (u16(buffer[3]) << 8)) as i16,
-            z: (u16(buffer[4]) + (u16(buffer[5]) << 8)) as i16,
-        })
+        let mut bytes = [0u8; N];
+        self.read_accel_registers(accel::Register::OUT_X_L_A, &mut bytes)?;
+
+        let mut results: I16x3Buf::<M> = I16x3Buf { i16x3buf: [I16x3 {x: 0, y: 0, z: 0 }; M]};
+
+        for i in 0..M {
+            let k = i*6;
+            results.i16x3buf[i] = I16x3 {
+                                x: (bytes[k] as u16 + ((bytes[k+1] as u16) << 8)) as i16,
+                                y: (bytes[k+2] as u16 + ((bytes[k+3] as u16) << 8)) as i16,
+                                z: (bytes[k+4] as u16 + ((bytes[k+5] as u16) << 8)) as i16,
+                                };
+        }
+        Ok(results)
     }
 
     /// Sets the accelerometer output data rate
@@ -73,23 +86,23 @@ where
         })
     }
 
-    /// Magnetometer measurements
-    pub fn mag(&mut self) -> Result<I16x3, E> {
-        let buffer: GenericArray<u8, U6> = self.read_mag_registers(mag::Register::OUT_X_H_M)?;
+    // /// Magnetometer measurements
+    // pub fn mag(&mut self) -> Result<I16x3, E> {
+    //     let buffer: GenericArray<u8, U6> = self.read_mag_registers(mag::Register::OUT_X_H_M)?;
 
-        Ok(I16x3 {
-            x: (u16(buffer[1]) + (u16(buffer[0]) << 8)) as i16,
-            y: (u16(buffer[5]) + (u16(buffer[4]) << 8)) as i16,
-            z: (u16(buffer[3]) + (u16(buffer[2]) << 8)) as i16,
-        })
-    }
+    //     Ok(I16x3 {
+    //         x: (u16(buffer[1]) + (u16(buffer[0]) << 8)) as i16,
+    //         y: (u16(buffer[5]) + (u16(buffer[4]) << 8)) as i16,
+    //         z: (u16(buffer[3]) + (u16(buffer[2]) << 8)) as i16,
+    //     })
+    // }
 
-    /// Sets the magnetometer output data rate
-    pub fn mag_odr(&mut self, odr: MagOdr) -> Result<(), E> {
-        self.modify_mag_register(mag::Register::CRA_REG_M, |r| {
-            r & !(0b111 << 2) | ((odr as u8) << 2)
-        })
-    }
+    /// Sets the magnetometer output data rate TODO: correct to use new modify_mag_reg
+    // pub fn mag_odr(&mut self, odr: MagOdr) -> Result<(), E> {
+    //     self.modify_mag_register(mag::Register::CRA_REG_M, |r| {
+    //         r & !(0b111 << 2) | ((odr as u8) << 2)
+    //     })
+    // }
 
     /// Temperature sensor measurement
     ///
@@ -109,6 +122,35 @@ where
         })
     }
 
+    /// Changes the `INT1 Interrupt mode` of the accelerometer
+    pub fn set_accel_int1_mode(&mut self, mode: I1ModeA) -> Result<(), E> {
+        self.modify_accel_register(accel::Register::CTRL_REG3_A, |r| {
+             r & !(0b1111111 << 1) | ((mode as u8) << 1)  // << 1 (shift over by 1 bit to align), 7 bits for mask
+        })
+    }
+
+    /// Toggles the FIFO on /off
+    pub fn set_accel_fifo_toggle(&mut self, mode: FIFOToggleA) -> Result<(), E> {
+        self.modify_accel_register(accel::Register::CTRL_REG5_A, |r| {
+             r & !(0b1 << 6) | ((mode as u8) << 6)  // offset 6 bits, and mask is size 1
+        })
+    }
+
+    /// Change the mode of the fifo
+    pub fn set_accel_fifo_mode(&mut self, mode: FIFOModeA) -> Result<(), E> {
+        self.modify_accel_register(accel::Register::FIFO_CTRL_REG_A, |r| {
+             r & !(0b11 << 6) | ((mode as u8) << 6)  // 
+        })
+    }
+
+    /// Change the watermark threshold of the fifo
+    pub fn set_accel_wtm_tr(&mut self, mode: usize) -> Result<(), E> {
+        self.modify_accel_register(accel::Register::FIFO_CTRL_REG_A, |r| {
+             r & !(0b11111 << 0) | ((mode as u8) << 0)  //
+        })
+    }
+
+
     fn modify_accel_register<F>(&mut self, reg: accel::Register, f: F) -> Result<(), E>
     where
         F: FnOnce(u8) -> u8,
@@ -118,56 +160,61 @@ where
         Ok(())
     }
 
-    fn modify_mag_register<F>(&mut self, reg: mag::Register, f: F) -> Result<(), E>
-    where
-        F: FnOnce(u8) -> u8,
+    // fn modify_mag_register<F>(&mut self, reg: mag::Register, buffer: &mut [u8]) -> Result<(), E>
+    // {
+    //     {
+    //         const MULTI: u8 = 1 << 7;
+    //         self.i2c
+    //             .write_read(mag::ADDRESS, &[reg.addr() | MULTI], buffer)?;  //look into "Block_read" if this does not work
+    //     }
+
+    //     Ok(())
+    // }
+
+    fn read_accel_registers(&mut self, reg: accel::Register, buffer: &mut [u8]) -> Result<(), E>
     {
-        let r = self.read_mag_register(reg)?;
-        self.write_mag_register(reg, f(r))?;
+        {
+            const MULTI: u8 = 1 << 7;
+            self.i2c
+                .write_read(accel::ADDRESS, &[reg.addr() | MULTI], buffer)?;  //look into "Block_read" if this does not work
+        }
+
         Ok(())
     }
 
-    fn read_accel_registers<N>(&mut self, reg: accel::Register) -> Result<GenericArray<u8, N>, E>
-    where
-        N: ArrayLength<u8>,
-    {
-        let mut buffer: GenericArray<u8, N> = unsafe { mem::uninitialized() };
-
-        {
-            let buffer: &mut [u8] = &mut buffer;
-
-            const MULTI: u8 = 1 << 7;
-            self.i2c
-                .write_read(accel::ADDRESS, &[reg.addr() | MULTI], buffer)?;
-        }
-
-        Ok(buffer)
-    }
-
     fn read_accel_register(&mut self, reg: accel::Register) -> Result<u8, E> {
-        self.read_accel_registers::<U1>(reg).map(|b| b[0])
+
+        // reads register, without multi setup
+        // may require testing to make sure that "MULTI" is not required
+        let mut read_result = [0u8, 0];
+        self.i2c.write_read(accel::ADDRESS, &[reg.addr()], &mut read_result)?;
+        Ok(read_result[0])
     }
 
     fn read_mag_register(&mut self, reg: mag::Register) -> Result<u8, E> {
-        let buffer: GenericArray<u8, U1> = self.read_mag_registers(reg)?;
-        Ok(buffer[0])
+        // reads register, without multi setup
+        // may require testing to make sure that "MULTI" is not required
+
+        let mut read_result = [0u8, 0];
+        self.i2c.write_read(mag::ADDRESS, &[reg.addr()], &mut read_result)?;
+        Ok(read_result[0])
     }
 
     // NOTE has weird address increment semantics; use only with `OUT_X_H_M`
-    fn read_mag_registers<N>(&mut self, reg: mag::Register) -> Result<GenericArray<u8, N>, E>
-    where
-        N: ArrayLength<u8>,
-    {
-        let mut buffer: GenericArray<u8, N> = unsafe { mem::uninitialized() };
+    // fn read_mag_registers<N>(&mut self, reg: mag::Register) -> Result<GenericArray<u8, N>, E>
+    // where
+    //     N: ArrayLength<u8>,
+    // {
+    //     let mut buffer: GenericArray<u8, N> = unsafe { mem::MaybeUninit::<&GenericArray<u8,N>>::uninit()};
 
-        {
-            let buffer: &mut [u8] = &mut buffer;
+    //     {
+    //         let buffer: &mut [u8] = &mut buffer;
 
-            self.i2c.write_read(mag::ADDRESS, &[reg.addr()], buffer)?;
-        }
+    //         self.i2c.write_read(mag::ADDRESS, &[reg.addr()], buffer)?;
+    //     }
 
-        Ok(buffer)
-    }
+    //     Ok(buffer)
+    // }
 
     fn write_accel_register(&mut self, reg: accel::Register, byte: u8) -> Result<(), E> {
         self.i2c.write(accel::ADDRESS, &[reg.addr(), byte])
@@ -179,7 +226,7 @@ where
 }
 
 /// XYZ triple
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct I16x3 {
     /// X component
     pub x: i16,
@@ -187,6 +234,15 @@ pub struct I16x3 {
     pub y: i16,
     /// Z component
     pub z: i16,
+}
+
+/// XYZ triple Buffer
+#[derive(Debug, Clone, Copy)]
+pub struct I16x3Buf <const N: usize> {
+
+    /// buffer for multiple gyro values read from the fifo
+    pub i16x3buf: [I16x3; N],
+    
 }
 
 /// Accelerometer Output Data Rate
@@ -244,4 +300,52 @@ impl Sensitivity {
     fn value(&self) -> u8 {
         *self as u8
     }
+}
+
+/// INT1 Interrupt Settings
+#[derive(Clone, Copy)]
+pub enum I1ModeA {
+    // Note 7, bits with LSB removed
+    // values will be shifted function
+
+    /// CLICK interrupt on INT1
+    I1_CLICK = 0b1000_000,
+    /// AOI1 interrupt on INT1
+    I1_AOI1 = 0b0100_000,
+    /// AOI2 interrupt on INT1
+    IN_AO2 = 0b0010_000,
+    /// DRDY1 interrupt on INT1
+    I1_DRDY1 = 0b0001_000,
+    /// DRDY2 interrupt on INT1
+    I1_DRDY2 = 0b0000_100,
+    /// FIFO Watermark interrupt on INT1
+    I1_WTM = 0b0000_010,
+    /// FIFO overrun interrupt on INT1
+    I1_OVERRUN = 0b0000_001,
+
+}
+
+
+/// FIFO Enable/Disable settings
+#[derive(Debug, Clone, Copy)]
+pub enum FIFOToggleA {
+    /// Disables the FIFO (default)
+    FIFO_DI = 0b0,
+    /// Enabls the FIFO
+    FIFO_EN = 0b1,
+}
+
+/// FIFO Modes
+/// 4 modes are available; bypass, FIFO, Stream, and trigger
+#[derive(Debug, Clone, Copy)]
+pub enum FIFOModeA {
+    /// Bypass mode (default)
+    Bypass = 0b00,
+    /// FIFO mode, data is stored til FIFO overflows then stops
+    Fifo = 0b01,
+    /// Stream mode, data is stored in FIFO, old data is replaced with new data
+    Stream = 0b10,
+    /// Trigger mode, can trigger on INT1 or INT2
+    Trigger = 0b11,
+
 }
